@@ -122,3 +122,83 @@ exports.deleteDocument = async (req, res) => {
     res.status(500).json({ message: 'Failed to delete document' });
   }
 };
+
+exports.sendDocumentEmail = async (req, res) => {
+  try {
+    const { borrowerEmail, bankEmail, documentTitle, htmlContent } = req.body;
+    if (!borrowerEmail || !bankEmail) {
+      return res.status(400).json({ message: 'Borrower and compliance emails are required' });
+    }
+
+    const emailService = require('../services/emailService');
+    const fs = require('fs');
+    const path = require('path');
+
+    let html = `
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h2>${documentTitle}</h2>
+        <p>Please find the secure document below:</p>
+        <hr/>
+        <div>${htmlContent || 'Document content not provided'}</div>
+      </div>
+    `;
+    console.log("Original HTML contains /download.png?", html.includes('/download.png'));
+    console.log("Original HTML contains /signature (1) (1).png?", html.includes('/signature (1) (1).png'));
+
+    const attachments = [];
+    const frontendPublicPath = path.join(__dirname, '../../LMS-frontend/public');
+    
+    // Parse and replace known local images with CID attachments
+    if (html.includes('/download.png')) {
+      const logoPath = path.join(frontendPublicPath, 'download.png');
+      if (fs.existsSync(logoPath)) {
+        attachments.push({
+          filename: 'download.png',
+          path: logoPath,
+          cid: 'logo_img@lenni.co.za'
+        });
+        html = html.replace(/\/download\.png/g, 'cid:logo_img@lenni.co.za');
+      }
+    }
+
+    if (html.includes('/signature (1) (1).png')) {
+      const sigPath = path.join(frontendPublicPath, 'signature (1) (1).png');
+      if (fs.existsSync(sigPath)) {
+        attachments.push({
+          filename: 'signature.png',
+          path: sigPath,
+          cid: 'sig_img@lenni.co.za'
+        });
+        // We use a regex that matches the spaces properly just in case
+        html = html.replace(/\/signature\s*\(1\)\s*\(1\)\.png/g, 'cid:sig_img@lenni.co.za');
+      }
+    }
+
+    // Send to borrower
+    await emailService.sendEmailImmediate({
+      to: borrowerEmail,
+      subject: `Secure Document: ${documentTitle}`,
+      html,
+      text: `Please review the document: ${documentTitle}`,
+      attachments,
+      emailType: 'DOCUMENT_SHARE'
+    });
+
+    // Send to bank/compliance
+    if (bankEmail && bankEmail !== borrowerEmail) {
+      await emailService.sendEmailImmediate({
+        to: bankEmail,
+        subject: `Secure Document: ${documentTitle} (Compliance Copy)`,
+        html,
+        text: `Please review the document: ${documentTitle}`,
+        attachments,
+        emailType: 'DOCUMENT_SHARE'
+      });
+    }
+
+    res.json({ message: 'Emails sent successfully' });
+  } catch (error) {
+    console.error('Error sending document email:', error);
+    res.status(500).json({ message: 'Failed to send email: ' + error.message });
+  }
+};

@@ -91,11 +91,26 @@ exports.getProfile = async (req, res) => {
     const latestLoan = user.loan[0];
     const loanMetadata = typeof latestLoan?.metadata === 'string' ? JSON.parse(latestLoan.metadata) : (latestLoan?.metadata || {});
 
+    let currentPhone = user.phone;
+
+    // Fallback/Migration for existing users: If User.phone is blank, migrate it from historical loan data
+    if (!currentPhone && loanMetadata.personalInfo) {
+      const historicalPhone = loanMetadata.personalInfo.cellphoneNumber || loanMetadata.personalInfo.phone;
+      if (historicalPhone) {
+        currentPhone = historicalPhone;
+        // Silently migrate the database record so it never relies on historical data again
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { phone: historicalPhone }
+        });
+      }
+    }
+
     res.json({
       name: user.name,
       email: loanMetadata.personalInfo?.email || user.email || '',
       company: user.company || latestLoan?.company || 'N/A',
-      phone: loanMetadata.personalInfo?.phone || user.phone || '',
+      phone: currentPhone || '',
       avatarUrl: user.avatarUrl,
       employeeReference: loanMetadata.employmentInfo?.employeeId || `LMS-${user.id.toString().padStart(5, '0')}`,
       memberSince: user.createdAt.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }),

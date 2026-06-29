@@ -83,6 +83,14 @@ exports.apply = async (req, res) => {
       }
     });
 
+    const phone = pInfo.cellphoneNumber || pInfo.phone;
+    if (phone) {
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { phone }
+      });
+    }
+
     res.status(201).json({ message: 'Application submitted successfully', loanId: loan.id });
   } catch (error) {
     console.error(error);
@@ -234,5 +242,199 @@ exports.getFullApplicationData = async (req, res) => {
   } catch (err) {
     console.error('[getFullApplicationData] error:', err);
     res.status(500).json({ message: 'Failed to retrieve application data' });
+  }
+};
+
+exports.applyGuest = async (req, res) => {
+  const bcrypt = require('bcryptjs');
+  const crypto = require('crypto');
+  const emailService = require('../services/emailService');
+
+  try {
+    const { 
+      personalInfo, 
+      employmentInfo, 
+      financialInfo, 
+      loanRequest, 
+      agreement 
+    } = req.body;
+
+    const pInfo = typeof personalInfo === 'string' ? JSON.parse(personalInfo) : personalInfo;
+    const eInfo = typeof employmentInfo === 'string' ? JSON.parse(employmentInfo) : employmentInfo;
+    const fInfo = typeof financialInfo === 'string' ? JSON.parse(financialInfo) : financialInfo;
+    const lReq = typeof loanRequest === 'string' ? JSON.parse(loanRequest) : loanRequest;
+    const agmt = typeof agreement === 'string' ? JSON.parse(agreement) : agreement;
+
+    const email = pInfo.email;
+    if (!email) {
+      return res.status(400).json({ message: 'Email address is required.' });
+    }
+
+    let user = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    let isRegistered = false;
+
+    if (!user) {
+      console.log(`[applyGuest] Email "${email}" not found in user table. Automatically creating guest user...`);
+      const tempPassword = await bcrypt.hash(Math.random().toString(36), 10);
+      user = await prisma.user.create({
+        data: {
+          email: email,
+          name: `${pInfo.name} ${pInfo.surname}`.trim() || 'Unknown Employee',
+          phone: pInfo.cellphoneNumber || pInfo.phone || null,
+          company: eInfo.employerName || 'Unknown',
+          password: tempPassword,
+          role: 'employee',
+          status: 'Active',
+          updatedAt: new Date()
+        }
+      });
+    } else {
+      console.log(`[applyGuest] Found existing user in user table: ID ${user.id}`);
+      const phone = pInfo.cellphoneNumber || pInfo.phone;
+      if (phone) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { phone }
+        });
+      }
+      
+      const registrationLog = await prisma.auditlog.findFirst({
+        where: {
+          action: 'REGISTRATION_COMPLETED',
+          user: email
+        }
+      });
+      isRegistered = !!registrationLog;
+    }
+
+    // Link all associated loans to this user's ID
+    await prisma.loan.updateMany({
+      where: { employeeEmail: email },
+      data: { userId: user.id }
+    });
+
+    const documentUrls = {};
+    if (!req.files || !req.files['latestPayslip'] || !req.files['signature'] || !req.files['idDocument'] || !req.files['bankStatement']) {
+      return res.status(400).json({ 
+        message: 'Missing mandatory documents. ID Copy, Latest Payslip, Bank Statement, and Employee Signature are required to apply for a loan.' 
+      });
+    }
+
+    Object.keys(req.files).forEach(key => {
+      documentUrls[key] = req.files[key][0].path;
+    });
+
+    const company = await prisma.company.findUnique({
+      where: { name: eInfo.employerName || 'Unknown' }
+    });
+
+    if (company && company.employeeNumbers) {
+      let allowedNumbers = [];
+      try {
+        allowedNumbers = typeof company.employeeNumbers === 'string'
+          ? JSON.parse(company.employeeNumbers)
+          : (Array.isArray(company.employeeNumbers) ? company.employeeNumbers : []);
+      } catch (parseErr) {
+        console.error("Failed to parse company employeeNumbers JSON:", parseErr);
+      }
+
+      if (allowedNumbers && allowedNumbers.length > 0) {
+        const empNum = String(eInfo.employeeNumber || '').trim().toUpperCase();
+        const isVerified = allowedNumbers.map(n => String(n).trim().toUpperCase()).includes(empNum);
+        
+        if (!isVerified) {
+          return res.status(400).json({
+            message: `Employee number "${eInfo.employeeNumber}" is not verified for ${eInfo.employerName}. Please check your number or contact your HR department.`
+          });
+        }
+      }
+    }
+
+    const loan = await prisma.loan.create({
+      data: {
+        reference: `LMS-${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`,
+        amount: parseFloat(lReq.amount),
+        userId: user.id,
+        company: eInfo.employerName || 'Unknown',
+        employeeEmail: email,
+        employeeName: `${pInfo.name} ${pInfo.surname}`.trim() || 'Unknown',
+        status: 'pending',
+        stage: 'SUBMITTED',
+        kickbackRate: company?.kickbackRate || 0,
+        discountRate: company?.discountRate || 0,
+        kickbackType: company?.kickbackType || 'PERCENTAGE',
+        commissionAmount: company?.commissionAmount || 0,
+        discountAmount: company?.discountAmount || 0,
+        updatedAt: new Date(),
+        metadata: {
+          personalInfo: pInfo,
+          employmentInfo: eInfo,
+          financialInfo: fInfo,
+          loanRequest: lReq,
+          agreement: agmt
+        },
+        documentUrls
+      }
+    });
+
+    let otp = '';
+    if (!isRegistered) {
+      otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expires = new Date(Date.now() + 10 * 60 * 1000);
+      const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+
+      await prisma.otp.create({
+        data: {
+          email,
+          otpHash,
+          purpose: 'REGISTRATION',
+          expiresAt: expires
+        }
+      });
+
+      console.log(`==========================================`);
+      console.log(`🔑 OTP generated for ${email}: ${otp}`);
+      console.log(`==========================================`);
+
+      await prisma.auditlog.create({
+        data: {
+          action: 'OTP_GENERATED',
+          user: email,
+          note: `OTP generated for secure portal activation: ${otp}`,
+          entityId: 'REGISTRATION'
+        }
+      });
+
+      const html = emailService.populateTemplate('otp', { otp });
+      const text = `Your Lenni Secure Portal activation verification OTP code is: ${otp}. It is valid for 10 minutes.`;
+      await emailService.queueEmail({
+        to: email,
+        subject: 'Lenni Portal Activation OTP Code',
+        html,
+        text,
+        emailType: 'AUTH_OTP',
+        relatedRecord: 'REGISTRATION'
+      });
+    }
+
+    res.status(201).json({ 
+      message: 'Application submitted successfully', 
+      loanId: loan.id,
+      reference: loan.reference,
+      registrationRequired: !isRegistered,
+      email: email,
+      otp: !isRegistered ? otp : undefined
+    });
+  } catch (error) {
+    console.error("APPLY GUEST ERROR:", error);
+    if (error instanceof Error) {
+      console.error(error.stack);
+    } else {
+      console.error(JSON.stringify(error));
+    }
+    res.status(500).json({ message: 'Failed to submit application: ' + (error.message || JSON.stringify(error)) });
   }
 };

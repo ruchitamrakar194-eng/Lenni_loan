@@ -8,6 +8,7 @@ router.use(authenticateToken);
 
 router.post('/', uploadDocument.single('file'), documentController.uploadDocument);
 router.get('/', documentController.getDocuments);
+router.post('/send-email', documentController.sendDocumentEmail);
 router.delete('/:id', documentController.deleteDocument);
 
 module.exports = router;

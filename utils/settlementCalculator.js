@@ -179,39 +179,36 @@ const calculateEarlySettlement = async (loan, includePipeline = false, now = new
 
   let pipelineDeduction = 0;
 
-  if (includePipeline && loan.installment && loan.installment.length > 0) {
-    const pending = loan.installment
-      .filter(i => i.status === 'PENDING')
-      .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+  if (loan.installment && loan.installment.length > 0) {
+    const pendingInstallments = loan.installment.filter(i => i.status === 'PENDING');
 
-    if (pending.length > 0) {
-      const currentInst = pending[0];
-      
-      let frequency = 'Monthly';
-      if (loan.metadata) {
-        try {
-          const meta = typeof loan.metadata === 'string' ? JSON.parse(loan.metadata) : loan.metadata;
-          frequency = meta.financialInfo?.salaryFrequency || 'Monthly';
-        } catch (e) {}
-      }
+    let frequency = 'Monthly';
+    if (loan.metadata) {
+      try {
+        const meta = typeof loan.metadata === 'string' ? JSON.parse(loan.metadata) : loan.metadata;
+        frequency = meta.financialInfo?.salaryFrequency || 'Monthly';
+      } catch (e) {}
+    }
 
-      const period = getInstallmentPeriod(currentInst.dueDate, frequency);
+    // Fetch schedules for the company to verify uploaded periods
+    const schedules = await prisma.deductionschedule.findMany({
+      where: { company: loan.company }
+    });
+    const schedulePeriods = new Set(schedules.map(s => s.period));
 
-      // Check if a deduction schedule has been submitted
-      const schedule = await prisma.deductionschedule.findFirst({
-        where: {
-          company: loan.company,
-          period: period
-        }
-      });
+    for (const inst of pendingInstallments) {
+      const period = getInstallmentPeriod(inst.dueDate, frequency);
+      const isPastOrToday = new Date(inst.dueDate) <= now;
+      const isScheduled = schedulePeriods.has(period);
 
-      if (schedule) {
-        pipelineDeduction = currentInst.amount;
+      if (isPastOrToday || isScheduled) {
+        pipelineDeduction += Math.max(0, inst.amount - (inst.paidAmount || 0));
       }
     }
   }
 
-  const settlementAmount = Math.max(0, outstandingBalance - settlementSaving - pipelineDeduction);
+  // Early settlement payment is only reduced by pipelineDeduction if includePipeline is explicitly true
+  const settlementAmount = Math.max(0, outstandingBalance - settlementSaving - (includePipeline ? pipelineDeduction : 0));
 
   return {
     outstandingBalance: Math.round(outstandingBalance * 100) / 100,

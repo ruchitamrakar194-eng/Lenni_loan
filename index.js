@@ -67,7 +67,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
@@ -120,6 +121,20 @@ app.get('/debug/send-test-email', async (req, res) => {
     console.error('🔴 Test email error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error("GLOBAL ERROR HANDLER CAUGHT AN ERROR:");
+  console.error(err);
+  if (err instanceof Error) {
+    console.error(err.stack);
+  }
+  
+  res.status(500).json({ 
+    message: err.message || 'Internal Server Error',
+    details: err 
+  });
 });
 
 // Start Server

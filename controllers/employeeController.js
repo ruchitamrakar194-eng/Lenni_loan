@@ -232,11 +232,10 @@ exports.getStatements = async (req, res) => {
       // Sort transactions: newest first
       loanTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-      // Per-loan summary
       const totalDisbursed = isDisbursed ? loan.amount : 0;
       const totalRepaid = loan.installment
         .filter(i => ['PAID', 'RECEIVED', 'COMPLETED'].includes((i.status || '').toUpperCase()))
-        .reduce((sum, i) => sum + i.amount, 0);
+        .reduce((sum, i) => sum + (i.paidAmount || i.amount), 0);
       const balance = Math.max(0, totalDisbursed - totalRepaid);
 
       const pendingInstallments = loan.installment.filter(i => (i.status || '').toUpperCase() === 'PENDING');
@@ -273,22 +272,34 @@ exports.getStatements = async (req, res) => {
     });
 
     // Overall summary across all loans
-    const grandTotalDisbursed = loanStatements.reduce((sum, l) => {
-      const raw = parseFloat((l.summary.totalDisbursed || '').replace(/[^0-9.]/g, '')) || 0;
-      return sum + raw;
-    }, 0);
-    const grandTotalRepaid = loanStatements.reduce((sum, l) => {
-      const raw = parseFloat((l.summary.totalRepaid || '').replace(/[^0-9.]/g, '')) || 0;
-      return sum + raw;
-    }, 0);
+    let grandTotalDisbursed = 0;
+    let grandTotalRepaid = 0;
+    let grandTotalBalance = 0;
+
+    loans.forEach(loan => {
+      const statusUpper = (loan.status || '').toUpperCase();
+      const stageUpper = (loan.stage || '').toUpperCase();
+      const isDisbursed = ['ACTIVE', 'DISBURSED', 'PAID'].some(x => statusUpper.includes(x)) ||
+                          ['ACTIVE', 'DISBURSED', 'PAID'].some(x => stageUpper.includes(x));
+
+      const totalDisbursed = isDisbursed ? loan.amount : 0;
+      const totalRepaid = loan.installment
+        .filter(i => ['PAID', 'RECEIVED', 'COMPLETED'].includes((i.status || '').toUpperCase()))
+        .reduce((sum, i) => sum + (i.paidAmount || i.amount), 0);
+      const balance = Math.max(0, totalDisbursed - totalRepaid);
+
+      grandTotalDisbursed += totalDisbursed;
+      grandTotalRepaid += totalRepaid;
+      grandTotalBalance += balance;
+    });
 
     res.json({
       loans: loanStatements,
       overall: {
         totalLoans: loans.length,
-        totalDisbursed: `R ${grandTotalDisbursed.toLocaleString('en-ZA', { minimumFractionDigits: 2 })}`,
-        totalRepaid: `R ${grandTotalRepaid.toLocaleString('en-ZA', { minimumFractionDigits: 2 })}`,
-        outstandingBalance: `R ${Math.max(0, grandTotalDisbursed - grandTotalRepaid).toLocaleString('en-ZA', { minimumFractionDigits: 2 })}`
+        totalDisbursed: `R ${grandTotalDisbursed.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        totalRepaid: `R ${grandTotalRepaid.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        outstandingBalance: `R ${grandTotalBalance.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
       }
     });
   } catch (error) {

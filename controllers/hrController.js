@@ -508,7 +508,7 @@ exports.getRemittances = async (req, res) => {
     const settlementPromises = filteredInstallments.map(async (i) => {
       const loanId = i.loan.id;
       if (!settlementCache[loanId]) {
-        settlementCache[loanId] = await calculateEarlySettlement(i.loan, false, now);
+        settlementCache[loanId] = await calculateEarlySettlement(i.loan, true, now);
       }
       const settlement = settlementCache[loanId];
       return {
@@ -526,7 +526,7 @@ exports.getRemittances = async (req, res) => {
         metadata: i.loan.metadata,
         note: i.note,
         actualBalance: settlement.outstandingBalance,
-        pipelineBalance: settlement.pipelineDeduction,
+        pipelineBalance: Math.max(0, settlement.outstandingBalance - settlement.pipelineDeduction),
         settlementAmount: settlement.settlementAmount
       };
     });

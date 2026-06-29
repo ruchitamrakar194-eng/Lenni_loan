@@ -514,7 +514,7 @@ exports.getReportCompanies = async (req, res) => {
 };
 
 exports.getReportsData = async (req, res) => {
-  const { type, company, range } = req.query;
+  const { type, company, range, startDate, endDate } = req.query;
   
   const getLoanDivision = (loan) => {
     try {
@@ -553,6 +553,10 @@ exports.getReportsData = async (req, res) => {
       filter.company = company;
     }
 
+    // Safely parse start and end dates with UTC boundary matching to avoid timezone offsets
+    const start = startDate ? new Date(`${startDate}T00:00:00.000Z`) : null;
+    const end = endDate ? new Date(`${endDate}T23:59:59.999Z`) : null;
+
     if (type === 'overdue') {
       loans = await prisma.loan.findMany({
         where: {
@@ -563,7 +567,13 @@ exports.getReportsData = async (req, res) => {
       });
       const formatted = [];
       loans.forEach(l => {
-        const overdueInsts = l.installment.filter(i => i.status === 'PENDING' && new Date(i.dueDate) < new Date());
+        const overdueInsts = l.installment.filter(i => {
+          const dDate = new Date(i.dueDate);
+          const isPending = i.status === 'PENDING';
+          const isOverdue = dDate < new Date();
+          const inRange = (!start || dDate >= start) && (!end || dDate <= end);
+          return isPending && isOverdue && inRange;
+        });
         if (overdueInsts.length > 0) {
           const totalOverdue = overdueInsts.reduce((sum, i) => sum + i.amount, 0);
           const meta = typeof l.metadata === 'string' ? JSON.parse(l.metadata) : (l.metadata || {});
@@ -607,12 +617,17 @@ exports.getReportsData = async (req, res) => {
         }
       });
       const formatted = [];
-      loans.forEach(l => {
-        const pendingInsts = l.installment ? l.installment.filter(i => i.status === 'PENDING') : [];
-        if (pendingInsts.length > 0) {
-          // Sort pending installments by dueDate to find the next/current one
-          pendingInsts.sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
-          const currentInst = pendingInsts[0];
+      for (const l of loans) {
+        const allPendingInsts = l.installment ? l.installment.filter(i => i.status === 'PENDING') : [];
+        const periodPendingInsts = allPendingInsts.filter(i => {
+          const dDate = new Date(i.dueDate);
+          return (!start || dDate >= start) && (!end || dDate <= end);
+        });
+
+        if (periodPendingInsts.length > 0) {
+          // Sort period pending installments to find the next/current one in range
+          periodPendingInsts.sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+          const currentInst = periodPendingInsts[0];
 
           const meta = typeof l.metadata === 'string' ? JSON.parse(l.metadata) : (l.metadata || {});
           const personalInfo = meta.personalInfo || {};
@@ -625,7 +640,11 @@ exports.getReportsData = async (req, res) => {
           const lastName = personalInfo.surname || parts.slice(1).join(' ') || '';
 
           const now = new Date();
-          const overdueInsts = pendingInsts.filter(i => new Date(i.dueDate) < now);
+          // Arrears are pending installments overdue before this current period's installment
+          const overdueInsts = allPendingInsts.filter(i => {
+            const dDate = new Date(i.dueDate);
+            return dDate < now && dDate < new Date(currentInst.dueDate);
+          });
           const arrearsVal = overdueInsts.reduce((sum, i) => sum + Math.max(0, i.amount - (i.paidAmount || 0)), 0);
 
           const repaymentVal = currentInst.amount;
@@ -638,10 +657,10 @@ exports.getReportsData = async (req, res) => {
             term = l.installment.length;
           }
 
-          const matrixValues = getLoanMatrixValues(l.amount, term);
-          const pipelineBal = matrixValues.totalRepayment;
-          const actualBal = calculateOutstandingBalance(l);
-          const settlementAmt = calculateSettlementAmount(l);
+          const settlement = await calculateEarlySettlement(l, true, now);
+          const actualBal = settlement.outstandingBalance;
+          const pipelineBal = Math.max(0, settlement.outstandingBalance - settlement.pipelineDeduction);
+          const settlementAmt = settlement.settlementAmount;
           const lastPayDate = repaymentDetails.lastPaymentDate || 'N/A';
 
           formatted.push({
@@ -664,13 +683,17 @@ exports.getReportsData = async (req, res) => {
             notes: currentInst.note || 'None'
           });
         }
-      });
+      }
       return res.json({ data: formatted, companyConfig });
     } else {
+      const loanFilter = { ...filter };
+      if (start || end) {
+        loanFilter.createdAt = {};
+        if (start) loanFilter.createdAt.gte = start;
+        if (end) loanFilter.createdAt.lte = end;
+      }
       loans = await prisma.loan.findMany({
-        where: {
-          ...filter
-        },
+        where: loanFilter,
         orderBy: { createdAt: 'desc' }
       });
       const formatted = loans.map(l => {
@@ -752,7 +775,105 @@ exports.getCompanyDivisions = async (req, res) => {
 };
 
 exports.sendReportEmail = async (req, res) => {
-  res.json({ message: 'Report email dispatched successfully.' });
+  const { reportType, company, frequency, periodDate, recordCount, pdfAttachment, fileName } = req.body;
+
+  if (!company) {
+    return res.status(400).json({ message: 'Company name is required.' });
+  }
+  if (!reportType) {
+    return res.status(400).json({ message: 'Report type is required.' });
+  }
+  if (!pdfAttachment) {
+    return res.status(400).json({ message: 'PDF report attachment is required.' });
+  }
+
+  try {
+    const emailService = require('../services/emailService');
+
+    // 1. Gather all target HR users for the company
+    const hrUsers = await prisma.user.findMany({
+      where: {
+        company: company,
+        role: 'hr'
+      },
+      select: { email: true }
+    });
+
+    // 2. Fetch company record for authorized signatory email
+    const companyInfo = await prisma.company.findUnique({
+      where: { name: company }
+    });
+
+    const emails = new Set();
+    hrUsers.forEach(u => {
+      if (u.email) emails.add(u.email.trim());
+    });
+    if (companyInfo && companyInfo.authorized_signatory_email) {
+      emails.add(companyInfo.authorized_signatory_email.trim());
+    }
+
+    if (emails.size === 0) {
+      return res.status(400).json({
+        message: `No registered HR contacts or authorized signatory email found for company "${company}". Please add HR contacts in the User directory first.`
+      });
+    }
+
+    const recipients = Array.from(emails).join(', ');
+
+    // 3. Send email immediately with generated PDF attachment
+    await emailService.sendEmailImmediate({
+      to: recipients,
+      subject: `Lenni LMS: ${reportType.toUpperCase()} - ${company} (${periodDate || 'All Period'})`,
+      html: `
+        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; color: #1e293b;">
+          <h2 style="color: #2563eb;">LENNI LMS</h2>
+          <p>Hello,</p>
+          <p>Please find attached the <strong>${reportType.toUpperCase()}</strong> for <strong>${company}</strong>.</p>
+          <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+          <p><strong>Report Summary Details:</strong></p>
+          <table style="border-collapse: collapse; width: 100%; max-width: 500px; font-size: 14px;">
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+              <td style="padding: 8px 0; font-weight: bold; color: #64748b; width: 150px;">Company</td>
+              <td style="padding: 8px 0; font-weight: bold; color: #1e293b;">${company}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+              <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Report Type</td>
+              <td style="padding: 8px 0; color: #1e293b; text-transform: uppercase;">${reportType}</td>
+            </tr>
+            ${frequency ? `
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+              <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Frequency</td>
+              <td style="padding: 8px 0; color: #1e293b; text-transform: capitalize;">${frequency}</td>
+            </tr>` : ''}
+            ${periodDate ? `
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+              <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Period Range</td>
+              <td style="padding: 8px 0; color: #2563eb; font-family: monospace;">${periodDate}</td>
+            </tr>` : ''}
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+              <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Record Count</td>
+              <td style="padding: 8px 0; color: #1e293b;">${recordCount} records</td>
+            </tr>
+          </table>
+          <p style="margin-top: 30px;">Best regards,<br>Lenni LMS Finance Team</p>
+        </div>
+      `,
+      attachments: [
+        {
+          filename: fileName || `${reportType}_report.pdf`,
+          content: pdfAttachment,
+          encoding: 'base64'
+        }
+      ],
+      emailType: 'FINANCE_REPORT',
+      relatedRecord: company
+    });
+
+    res.json({ message: `Report successfully dispatched to HR contacts for ${company} (${recipients}).` });
+  } catch (error) {
+    console.error('sendReportEmail Controller Error:', error);
+    res.status(500).json({ message: `SMTP/Email dispatch failed: ${error.message || error}` });
+  }
 };
 
 exports.getSettlementEligibleLoans = async (req, res) => {

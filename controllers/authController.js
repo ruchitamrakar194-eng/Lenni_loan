@@ -227,7 +227,7 @@ exports.sendOtp = async (req, res) => {
       data: {
         action: 'OTP_GENERATED',
         user: email,
-        note: `OTP generated for secure portal activation.`,
+        note: `OTP generated for secure portal activation: ${otp}`,
         entityId: 'REGISTRATION'
       }
     });
@@ -244,7 +244,10 @@ exports.sendOtp = async (req, res) => {
       relatedRecord: 'REGISTRATION'
     });
 
-    res.json({ message: 'Verification OTP has been sent to your email address.' });
+    res.json({ 
+      message: 'Verification OTP has been sent to your email address.',
+      otp: otp
+    });
   } catch (error) {
     console.error('Send OTP Error:', error);
     res.status(500).json({ message: 'Failed to send verification OTP: ' + error.message });
