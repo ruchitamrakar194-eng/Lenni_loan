@@ -7,26 +7,30 @@ exports.getStats = async (req, res) => {
 
     const pendingPayouts = loans.filter(l =>
       (l.stage === 'ADMIN_APPROVAL_PENDING' ||
-      l.stage === 'ADMIN_APPROVAL' ||
-      l.stage === 'APPROVED' ||
-      l.stage === 'FINANCE_PENDING' ||
-      l.status.toLowerCase().includes('admin approved') ||
-      l.status.toLowerCase().includes('credit approved')) &&
+       l.stage === 'ADMIN_APPROVAL' ||
+       l.stage === 'APPROVED' ||
+       l.stage === 'FINANCE_PENDING' ||
+       l.status.toLowerCase().includes('admin approved') ||
+       l.status.toLowerCase().includes('credit approved')) &&
       l.disbursementType !== 'Immediate'
     );
 
+    // Use same status criteria as getReportsData for disbursed/active loans
+    const activeStatusSet = new Set(['Active', 'ACTIVE', 'Disbursed', 'DISBURSED']);
     const disbursedLoans = loans.filter(l =>
-      ['ACTIVE', 'DISBURSED', 'PAID'].includes(l.stage) ||
-      ['active', 'disbursed', 'paid'].includes(l.status.toLowerCase())
+      activeStatusSet.has(l.status) ||
+      ['ACTIVE', 'DISBURSED', 'PAID'].includes(l.stage)
     );
 
     const pendingAmount = pendingPayouts.reduce((sum, l) => sum + Number(l.amount || 0), 0);
     const totalDisbursed = disbursedLoans.reduce((sum, l) => sum + Number(l.amount || 0), 0);
+    const totalLoans = disbursedLoans.length; // Count of loans considered disbursed/active
 
     res.json({
       pendingAmount,
       pendingCount: pendingPayouts.length,
       totalDisbursed,
+      totalLoans,
       failedPayments: 0
     });
   } catch (error) {
